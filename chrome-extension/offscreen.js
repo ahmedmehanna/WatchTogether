@@ -24,6 +24,16 @@ let dataChannel = null;
 let role = null; // 'host' | 'guest'
 let roomCode = null;
 
+// Reconnection state
+let reconnectAttempts = 0;
+let reconnectTimerId = null;
+
+// Heartbeat state — we send a ping every 25 s and expect a pong back.
+// If no pong arrives within 35 s the connection is silently dead and we
+// force-close so the reconnect logic kicks in.
+let heartbeatIntervalId = null;
+let lastPongAt = 0;
+
 // Last known state of the local video (if a supported site is open in the
 // tab), kept updated from 'video-event' messages sent by the content script.
 // Used to answer "what's your current state?" the moment a connection opens.
@@ -34,6 +44,41 @@ let lastLocalState = null; // { time, paused }
 // the host, per the "host manages the URL" model.
 let lastKnownUrl = null;
 let lastAnnouncedUrl = null; // last URL we actually told the guest about (dedupe)
+
+function startHeartbeat() {
+  stopHeartbeat();
+  lastPongAt = Date.now();
+  heartbeatIntervalId = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (Date.now() - lastPongAt > 35000) {
+      // Server went silent — force a close so the reconnect path fires
+      ws.close();
+      return;
+    }
+    sendSignaling({ type: 'ping' });
+  }, 25000);
+}
+
+function stopHeartbeat() {
+  if (heartbeatIntervalId) {
+    clearInterval(heartbeatIntervalId);
+    heartbeatIntervalId = null;
+  }
+}
+
+function scheduleReconnect() {
+  if (!roomCode) return; // not in a party — nothing to reconnect to
+  if (reconnectTimerId) return; // already scheduled
+
+  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+  reconnectAttempts++;
+  notifyPopup({ type: 'status', status: 'reconnecting', message: `Connection lost. Retrying in ${Math.round(delay / 1000)}s…` });
+
+  reconnectTimerId = setTimeout(() => {
+    reconnectTimerId = null;
+    connectSignaling();
+  }, delay);
+}
 
 function notifyPopup(message) {
   chrome.runtime.sendMessage({ target: 'popup', ...message }).catch(() => {
@@ -48,14 +93,30 @@ function connectSignaling() {
 
   ws.onopen = () => {
     console.log('[offscreen] connected to signaling server');
+    reconnectAttempts = 0;
+    startHeartbeat();
+
+    // Reconnect path: if we were mid-party when the socket dropped, rejoin.
+    if (roomCode && role) {
+      sendSignaling({ type: 'rejoin', code: roomCode, role });
+    }
   };
 
   ws.onerror = () => {
-    notifyPopup({ type: 'status', status: 'error', message: 'Could not reach signaling server. Is it running?' });
+    if (!roomCode) {
+      // Only show an error to the user on the initial connection attempt;
+      // during a reconnect the onclose handler already shows a status.
+      notifyPopup({ type: 'status', status: 'error', message: 'Could not reach signaling server. Is it running?' });
+    }
   };
 
   ws.onclose = () => {
-    notifyPopup({ type: 'status', status: 'disconnected', message: 'Disconnected from signaling server.' });
+    stopHeartbeat();
+    if (roomCode) {
+      scheduleReconnect();
+    } else {
+      notifyPopup({ type: 'status', status: 'disconnected', message: 'Disconnected from signaling server.' });
+    }
   };
 
   ws.onmessage = async (event) => {
@@ -109,6 +170,36 @@ function connectSignaling() {
           notifyPopup({ type: 'join-failed', message: msg.message });
         } else {
           notifyPopup({ type: 'status', status: 'error', message: msg.message });
+        }
+        break;
+
+      // --- Heartbeat response ---
+      case 'pong':
+        lastPongAt = Date.now();
+        break;
+
+      // --- Reconnection outcomes ---
+      case 'rejoined':
+        notifyPopup({ type: 'status', status: 'reconnecting', message: 'Signaling reconnected.' });
+        // If the WebRTC data channel also died while we were offline, the host
+        // re-initiates the offer so both sides get a fresh P2P connection.
+        if (role === 'host' && (!dataChannel || dataChannel.readyState !== 'open')) {
+          teardownPeerConnection();
+          startWebRTCAsHost();
+        }
+        break;
+
+      case 'peer-reconnecting':
+        // Partner's signaling socket dropped — hold on, they may come back.
+        notifyPopup({ type: 'status', status: 'reconnecting', message: 'Partner lost connection. Waiting for them to reconnect…' });
+        break;
+
+      case 'peer-reconnected':
+        // Partner is back. If we're the host and WebRTC died, re-initiate.
+        notifyPopup({ type: 'status', status: 'reconnecting', message: 'Partner reconnected! Re-establishing sync…' });
+        if (role === 'host' && (!dataChannel || dataChannel.readyState !== 'open')) {
+          teardownPeerConnection();
+          startWebRTCAsHost();
         }
         break;
     }
@@ -224,8 +315,10 @@ async function startWebRTCAsGuest() {
 }
 
 async function handleSignal(data) {
-  if (!pc) {
-    // Guest receives the offer before it has a PeerConnection yet.
+  if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+    // Guest receiving a fresh offer — either first connect or after a reconnect
+    // where the host decided to re-initiate. Clean up any dead PC first.
+    teardownPeerConnection();
     await startWebRTCAsGuest();
   }
 
@@ -256,6 +349,11 @@ function teardownPeerConnection() {
 }
 
 function leaveParty() {
+  // Cancel any pending reconnect so we don't try to rejoin after leaving
+  stopHeartbeat();
+  if (reconnectTimerId) { clearTimeout(reconnectTimerId); reconnectTimerId = null; }
+  reconnectAttempts = 0;
+
   sendSignaling({ type: 'leave' });
   teardownPeerConnection();
   if (ws) {

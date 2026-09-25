@@ -111,13 +111,76 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      // --- Reconnection: client dropped and is rejoining the same room ---
+      case 'rejoin': {
+        const code = (msg.code || '').toUpperCase().trim();
+        const role = msg.role;
+
+        if (role !== 'host' && role !== 'guest') {
+          send(ws, { type: 'error', message: 'Invalid role for rejoin.' });
+          return;
+        }
+
+        const room = rooms.get(code);
+        if (!room) {
+          send(ws, { type: 'error', message: 'Party code not found or expired.' });
+          return;
+        }
+
+        // Cancel the grace-period timer so the room isn't deleted
+        if (room[`${role}Timer`]) {
+          clearTimeout(room[`${role}Timer`]);
+          room[`${role}Timer`] = null;
+        }
+
+        room[role] = ws;
+        ws._roomCode = code;
+        ws._role = role;
+
+        send(ws, { type: 'rejoined', code, role });
+
+        const other = role === 'host' ? room.guest : room.host;
+        send(other, { type: 'peer-reconnected' });
+
+        console.log(`[party] ${role} rejoined room ${code}`);
+        break;
+      }
+
+      // --- Application-level keepalive ---
+      case 'ping': {
+        send(ws, { type: 'pong' });
+        break;
+      }
+
       default:
         send(ws, { type: 'error', message: `Unknown message type: ${msg.type}` });
     }
   });
 
   ws.on('close', () => {
-    closeRoom(ws, 'peer-disconnected');
+    const code = ws._roomCode;
+    if (!code) return;
+
+    const room = rooms.get(code);
+    if (!room) return;
+
+    const role = ws._role;
+    const other = role === 'host' ? room.guest : room.host;
+
+    // Clear the socket reference but keep the room alive for 15 s.
+    // If the client reconnects within that window (via 'rejoin') the party
+    // continues; otherwise the room is deleted and the peer is notified.
+    room[role] = null;
+    send(other, { type: 'peer-reconnecting' });
+
+    room[`${role}Timer`] = setTimeout(() => {
+      room[`${role}Timer`] = null;
+      send(other, { type: 'peer-disconnected' });
+      rooms.delete(code);
+      console.log(`[party] room ${code} closed — ${role} did not reconnect in time`);
+    }, 15000);
+
+    console.log(`[party] ${role} disconnected from room ${code}, waiting for rejoin…`);
   });
 });
 
@@ -127,6 +190,10 @@ function closeRoom(ws, notifyType) {
 
   const room = rooms.get(code);
   if (!room) return;
+
+  // Cancel any pending reconnect timers
+  if (room.hostTimer) { clearTimeout(room.hostTimer); room.hostTimer = null; }
+  if (room.guestTimer) { clearTimeout(room.guestTimer); room.guestTimer = null; }
 
   const other = ws._role === 'host' ? room.guest : room.host;
   send(other, { type: notifyType });
