@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "WatchTogether",
+  "version": "0.3.0",
+  "description": "Watch movies in sync with someone else, each on your own browser, plus a built-in camera.",
+  "permissions": ["offscreen", "storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "WatchTogether"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["adapters.js", "content-script.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

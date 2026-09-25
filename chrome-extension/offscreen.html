@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+<head><title>WatchTogether offscreen</title></head>
+<body>
+  <!-- This page is never shown to the user. It exists purely to hold a
+       persistent WebSocket + WebRTC connection, because MV3 service
+       workers get killed after ~30s idle and would drop the connection. -->
+  <script src="config.js"></script>
+  <script src="offscreen.js"></script>
+</body>
+</html>
